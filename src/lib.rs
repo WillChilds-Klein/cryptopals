@@ -8,7 +8,7 @@ fn from_base16(input: &str) -> Vec<u8> {
     assert_eq!(0, input.len() % 2);
     let mut bytes = Vec::new();
     for ii in (0..input.len()).step_by(2) {
-        bytes.push(u8::from_str_radix(&input[ii..ii+2], 16).unwrap());
+        bytes.push(u8::from_str_radix(&input[ii..ii + 2], 16).unwrap());
     }
     bytes
 }
@@ -48,18 +48,19 @@ fn find_single_byte_xor_key(input: &Vec<u8>) -> u8 {
                     //       difference of 32, i.e. the 2^5 bit is either set or not set), so assume
                     //       real sentences tend to have higher ratio of lower-case letters. use this
                     //       heuristic to break the tie.
-                    let lower_case_count = s.chars()
+                    let lower_case_count = s
+                        .chars()
                         .filter(|c| c.is_ascii_lowercase() || *c == ' ')
                         .count();
-                    let lower_case_ratio = lower_case_count as f32 /  s.len() as f32;
+                    let lower_case_ratio = lower_case_count as f32 / s.len() as f32;
                     if lower_case_ratio > lowest.2 {
                         lowest = (c, score, lower_case_ratio);
                     }
                 }
-            },
+            }
             Err(_) => {
                 continue;
-            },
+            }
         };
     }
     lowest.0
@@ -75,7 +76,7 @@ fn find_single_byte_xor_key(input: &Vec<u8>) -> u8 {
 /// * `input` - A string slice to measure the "englishness" of
 fn english_text_score(input: &str) -> f32 {
     // @see https://web.archive.org/web/20170918020907/http://www.data-compression.com/english.html
-    let reference_frequencies: HashMap<char,f32> = HashMap::from_iter(vec![
+    let reference_frequencies: HashMap<char, f32> = HashMap::from_iter(vec![
         ('a', 0.0651738),
         ('b', 0.0124248),
         ('c', 0.0217339),
@@ -105,7 +106,7 @@ fn english_text_score(input: &str) -> f32 {
         (' ', 0.1918182),
     ]);
     // initialize input character counts
-    let mut char_counts: HashMap<char,u32> = HashMap::new();
+    let mut char_counts: HashMap<char, u32> = HashMap::new();
     for (c, _) in reference_frequencies.iter() {
         char_counts.insert(*c, 0);
     }
@@ -114,7 +115,7 @@ fn english_text_score(input: &str) -> f32 {
     for c in input.chars() {
         let cl = c.to_ascii_lowercase();
         if reference_frequencies.contains_key(&cl) {
-            char_counts.insert(cl, char_counts.get( & cl).unwrap() + 1);
+            char_counts.insert(cl, char_counts.get(&cl).unwrap() + 1);
             total_char_count += 1;
         }
     }
@@ -158,13 +159,14 @@ fn find_keysize(ciphertext: &Vec<u8>) -> usize {
         ciphertext_padded.extend(vec![0u8; pad_size]);
         assert_eq!(0, ciphertext_padded.len() % candidate_keysize);
         // NOTE: 2D vector for convenience, vector of slices would be faster
-        let chunks: Vec<Vec<u8>> = ciphertext_padded.chunks_exact(candidate_keysize)
+        let chunks: Vec<Vec<u8>> = ciphertext_padded
+            .chunks_exact(candidate_keysize)
             .map(|s| s.into())
             .collect();
         // TODO: justify this narsty quadratic behavior
         let mut distances: Vec<u64> = Vec::new();
         for ii in 0..chunks.len() {
-            for jj in ii+1..chunks.len() {
+            for jj in ii + 1..chunks.len() {
                 distances.push(hamming_distance(&chunks[ii], &chunks[jj]));
             }
         }
@@ -180,7 +182,7 @@ fn find_keysize(ciphertext: &Vec<u8>) -> usize {
 
 fn transpose(input: &Vec<Vec<u8>>) -> Vec<Vec<u8>> {
     let width = input.len();
-    let height = input.get(0).unwrap().len();   // TODO handle 0-size case
+    let height = input.get(0).unwrap().len(); // TODO handle 0-size case
     let mut output: Vec<Vec<u8>> = vec![vec![0u8; width]; height];
     for ii in 0..width {
         for jj in 0..height {
@@ -197,9 +199,10 @@ fn find_xor_key(ciphertext: &Vec<u8>) -> Vec<u8> {
     ciphertext_padded.extend(vec![0u8; pad_size]);
     assert_eq!(0, ciphertext_padded.len() % keysize);
     let transposed_blocks = transpose(
-        &ciphertext_padded.chunks_exact(keysize)
+        &ciphertext_padded
+            .chunks_exact(keysize)
             .map(|s| s.into())
-            .collect()
+            .collect(),
     );
     let mut key: Vec<u8> = Vec::new();
     assert_eq!(keysize, transposed_blocks.len());
@@ -221,7 +224,7 @@ fn aes_128_ecb_decrypt(ciphertext: &Vec<u8>, key: &Vec<u8>) -> Option<Vec<u8>> {
         Err(e) => {
             println!("{}", e);
             None
-        },
+        }
     }
 }
 
@@ -243,12 +246,16 @@ mod tests {
         let one = "1c0111001f010100061a024b53535009181c";
         let two = "686974207468652062756c6c277320657965";
         let output = "746865206b696420646f6e277420706c6179";
-        assert_eq!(output, to_base16(&xor(&from_base16(one), &from_base16(two))));
+        assert_eq!(
+            output,
+            to_base16(&xor(&from_base16(one), &from_base16(two)))
+        );
     }
 
     #[test] // Challenge 1.3
     fn test_find_single_char_xor_decrypt() {
-        let ciphertext = from_base16("1b37373331363f78151b7f2b783431333d78397828372d363c78373e783a393b3736");
+        let ciphertext =
+            from_base16("1b37373331363f78151b7f2b783431333d78397828372d363c78373e783a393b3736");
         let key = 'X' as u8;
         let plaintext = String::from_utf8(xor(&ciphertext, &vec![key; ciphertext.len()])).unwrap();
         assert_eq!(key, find_single_byte_xor_key(&ciphertext));
@@ -263,14 +270,12 @@ mod tests {
             .map(str::trim)
             .map(from_base16)
             .collect();
-        let mut lowest = (f32::MAX, 0u8, Vec::new());   // score, key, ciphertext
+        let mut lowest = (f32::MAX, 0u8, Vec::new()); // score, key, ciphertext
         for ciphertext in ciphertexts {
             let key = find_single_byte_xor_key(&ciphertext);
             let plaintext = xor(&ciphertext, &vec![key; ciphertext.len()]);
             let score = match String::from_utf8(plaintext) {
-                Ok(s) => {
-                    english_text_score(&s)
-                },
+                Ok(s) => english_text_score(&s),
                 Err(_) => {
                     continue;
                 }
@@ -279,9 +284,7 @@ mod tests {
                 lowest = (score, key, Vec::from(ciphertext));
             }
         }
-        let plaintext = String::from_utf8(
-            xor(&lowest.2, &vec![lowest.1; lowest.2.len()])
-        ).unwrap();
+        let plaintext = String::from_utf8(xor(&lowest.2, &vec![lowest.1; lowest.2.len()])).unwrap();
         assert_eq!(53u8, lowest.1);
         assert_eq!("Now that the party is jumping\n", plaintext);
     }
@@ -289,7 +292,10 @@ mod tests {
     #[test] // Challenge 1.5
     fn test_repeating_key_xor_encrypt_decrypt() {
         let expected_ciphertext = from_base16("0b3637272a2b2e63622c2e69692a23693a2a3c6324202d623d63343c2a26226324272765272a282b2f20430a652e2c652a3124333a653e2b2027630c692b20283165286326302e27282f");
-        let plaintext = "Burning 'em, if you ain't quick and nimble\nI go crazy when I hear a cymbal".as_bytes().to_vec();
+        let plaintext =
+            "Burning 'em, if you ain't quick and nimble\nI go crazy when I hear a cymbal"
+                .as_bytes()
+                .to_vec();
         let key = "ICE".as_bytes().to_vec();
         let actual_ciphertext = repeating_key_xor(&plaintext, &key);
         assert_eq!(expected_ciphertext, actual_ciphertext);
@@ -310,12 +316,15 @@ mod tests {
             fs::read_to_string("tst/data/01_06.txt")
                 .expect("Cannot read input data")
                 .replace('\n', "")
-                .as_str()
+                .as_str(),
         );
         assert_eq!(29, find_keysize(&ciphertext));
         let plaintext = decrypt_xor(&ciphertext);
         let prelude = "I'm back and I'm ringin' the bell";
-        assert_eq!(prelude, String::from_utf8(plaintext[0..prelude.len()].to_vec()).unwrap());
+        assert_eq!(
+            prelude,
+            String::from_utf8(plaintext[0..prelude.len()].to_vec()).unwrap()
+        );
     }
 
     #[test] // Challenge 1.7
@@ -324,26 +333,30 @@ mod tests {
             fs::read_to_string("tst/data/01_07.txt")
                 .expect("Cannot read input data")
                 .replace('\n', "")
-                .as_str()
+                .as_str(),
         );
         let key = "YELLOW SUBMARINE";
         let plaintext = aes_128_ecb_decrypt(&ciphertext, &key.as_bytes().to_vec()).unwrap();
         let prelude = "I'm back and I'm ringin' the bell";
-        assert_eq!(prelude, String::from_utf8(plaintext[0..prelude.len()].to_vec()).unwrap());
+        assert_eq!(
+            prelude,
+            String::from_utf8(plaintext[0..prelude.len()].to_vec()).unwrap()
+        );
     }
 
     #[test] // Challenge 1.8
     fn test_detect_ecb() {
         // basically, we just look for any entry with repeated 16-byte chunks.
         let ciphertexts: Vec<Vec<u8>> = fs::read_to_string("tst/data/01_08.txt")
-                .expect("Cannot read input data")
-                .lines()
-                .map(from_base16)
-                .collect();
-        let mut repeated_chunk_counts= Vec::new();
+            .expect("Cannot read input data")
+            .lines()
+            .map(from_base16)
+            .collect();
+        let mut repeated_chunk_counts = Vec::new();
         for ciphertext in ciphertexts {
             let mut repeated_chunks = HashMap::new();
-            ciphertext.chunks_exact(16)
+            ciphertext
+                .chunks_exact(16)
                 .for_each(|chunk| *repeated_chunks.entry(chunk.to_vec()).or_insert(0) += 1);
             repeated_chunks.retain(|_, v| *v > 1);
             if repeated_chunks.len() > 0 {
