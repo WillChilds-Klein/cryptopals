@@ -1,8 +1,12 @@
 use std::collections::HashMap;
 use std::iter::FromIterator;
 
-// TODO rip out dependencies, re-implement base{16,64} un/parsing
+// TODO rip out encoding dependencies, re-implement base{16,64} un/parsing
 // TODO consolidate to/from methods to take radix as parameter
+// TODO take a stab at implementing aes block cipher (ECB mode for simplicity?)
+// TODO break out separate modules per challenge set, factor out various util modules
+// TODO write README with explanation that performance/low-copy is an explicit non-goal, preferring simplicity/clarity
+// TODO organize tests such that name corresponds to challenge # where appropriate, remove extraneous comments
 
 fn from_base16(input: &str) -> Vec<u8> {
     assert_eq!(0, input.len() % 2);
@@ -217,31 +221,149 @@ fn decrypt_xor(ciphertext: &Vec<u8>) -> Vec<u8> {
     repeating_key_xor(&ciphertext, &key)
 }
 
-fn aes_128_ecb_decrypt(ciphertext: &Vec<u8>, key: &Vec<u8>) -> Option<Vec<u8>> {
+/// @see https://datatracker.ietf.org/doc/html/rfc2315#section-10.3
+///
+/// > For such algorithms, the method shall be to pad the input at the
+/// > trailing end with k - (l mod k) octets all having value k -
+/// > (l mod k), where l is the length of the input.
+fn pkcs7_pad(input: &Vec<u8>, block_size: usize) -> Vec<u8> {
+    let mut output = input.clone();
+    let pad_size = block_size - (input.len() % block_size);
+    assert!(pad_size <= block_size);
+    output.append(&mut vec![pad_size as u8; pad_size]);
+    output
+}
+
+fn pkcs7_unpad(input: &Vec<u8>) -> Vec<u8> {
+    let mut output = input.clone();
+    let pad_size = output[output.len() - 1];
+    output.truncate(input.len() - pad_size as usize);
+    output
+}
+
+fn aes_128_ecb_decrypt(ciphertext: &Vec<u8>, key: &Vec<u8>, do_pad: bool) -> Option<Vec<u8>> {
+    match aes_128_ecb_common(ciphertext, key, openssl::symm::Mode::Decrypt) {
+        Some(s) => Some(if do_pad { pkcs7_unpad(&s) } else { s }),
+        None => None,
+    }
+}
+
+fn aes_128_ecb_encrypt(input_plaintext: &Vec<u8>, key: &Vec<u8>, do_pad: bool) -> Option<Vec<u8>> {
+    let block_size = openssl::symm::Cipher::aes_128_ecb().block_size();
+    let plaintext = if do_pad {
+        pkcs7_pad(&input_plaintext, block_size)
+    } else {
+        input_plaintext.clone()
+    };
+    aes_128_ecb_common(&plaintext, key, openssl::symm::Mode::Encrypt)
+}
+
+fn aes_128_ecb_common(data: &Vec<u8>, key: &Vec<u8>, mode: openssl::symm::Mode) -> Option<Vec<u8>> {
     let cipher = openssl::symm::Cipher::aes_128_ecb();
-    match openssl::symm::decrypt(cipher, &key[..], None, &ciphertext[..]) {
-        Ok(s) => Some(s),
-        Err(e) => {
-            println!("{}", e);
-            None
+    let block_size = cipher.block_size();
+    let mut output = Vec::new();
+    let block_buffer = &mut vec![0u8; 2 * block_size][..]; // openssl wrapper requires over-sized output buffer
+    for ii in 0..(data.len() / block_size) + 1 {
+        let block_start = block_size * ii;
+        let block_end = std::cmp::min(block_start + block_size, data.len());
+        let block = data[block_start..block_end].to_vec();
+
+        // NOTE: need to create new Crypter for each block due to openssl crate's limitations. they don't
+        //       expose a "reset" method on the Crypter context. also, we're using lower-level Crypter instead
+        //       of Cipher because the latter doesn't expose padding configuration, turns padding on by default, and
+        //       pads to 32 bytes (which is odd given that AES block size is 16 bytes). maybe this would help:
+        //       https://github.com/sfackler/rust-openssl/issues/1156
+        let mut crypter = openssl::symm::Crypter::new(cipher, mode, key, None).unwrap();
+        crypter.pad(false);
+
+        let count = crypter.update(&block, block_buffer).unwrap();
+        let rest = crypter.finalize(&mut block_buffer[count..]).unwrap();
+        output.append(&mut block_buffer[..(count + rest)].to_vec());
+    }
+    Some(output)
+}
+
+// TODO clean up the Option interface -- move to Result<Vec<u8>,MyErr> where MyErr is customer error?
+
+fn aes_128_cbc_decrypt(
+    ciphertext: &Vec<u8>,
+    key: &Vec<u8>,
+    iv: &Vec<u8>,
+    do_pad: bool,
+) -> Option<Vec<u8>> {
+    let block_size = openssl::symm::Cipher::aes_128_cbc().block_size();
+    assert_eq!(block_size, key.len());
+    assert_eq!(0, ciphertext.len() % block_size);
+    assert_eq!(block_size, iv.len());
+    let mut prev_block = iv.clone();
+    let mut plaintext = Vec::new();
+    for ii in 0..(ciphertext.len() / block_size) {
+        let block_start = block_size * ii;
+        let block_end = block_start + block_size;
+        let block = &ciphertext[block_start..block_end].to_vec();
+        match aes_128_ecb_decrypt(&block, key, false) {
+            Some(s) => {
+                plaintext.extend(xor(&s, &prev_block));
+                prev_block.copy_from_slice(&ciphertext[block_start..block_end]);
+            }
+            None => return None,
         }
     }
+    Some(if do_pad {
+        pkcs7_unpad(&plaintext)
+    } else {
+        plaintext
+    })
+}
+
+fn aes_128_cbc_encrypt(
+    input_plaintext: &Vec<u8>,
+    key: &Vec<u8>,
+    iv: &Vec<u8>,
+    do_pad: bool,
+) -> Option<Vec<u8>> {
+    let block_size = openssl::symm::Cipher::aes_128_cbc().block_size();
+    assert_eq!(block_size, key.len());
+    assert_eq!(block_size, iv.len());
+    let plaintext = if do_pad {
+        pkcs7_pad(&input_plaintext, block_size)
+    } else {
+        input_plaintext.clone()
+    };
+    assert_eq!(0, plaintext.len() % block_size);
+    assert_eq!(block_size, key.len());
+    let mut prev_block = iv.clone();
+    let mut ciphertext = Vec::new();
+    for ii in 0..(plaintext.len() / block_size) {
+        let block_start = block_size * ii;
+        let block_end = block_start + block_size;
+        let block = &plaintext[block_start..block_end].to_vec();
+        match aes_128_ecb_encrypt(&xor(&block, &prev_block), key, false) {
+            Some(s) => {
+                ciphertext.extend(&s);
+                prev_block.copy_from_slice(&ciphertext[block_start..block_end]);
+            }
+            None => return None,
+        }
+    }
+    Some(ciphertext)
 }
 
 #[cfg(test)]
 mod tests {
+    use rand::Rng;
     use std::fs;
 
     use crate::*;
 
-    #[test] // Challenge 1.1
+    #[test] // Challenge 1
     fn test_base16_to_base64() {
         let input = "49276d206b696c6c696e6720796f757220627261696e206c696b65206120706f69736f6e6f7573206d757368726f6f6d";
         let output = "SSdtIGtpbGxpbmcgeW91ciBicmFpbiBsaWtlIGEgcG9pc29ub3VzIG11c2hyb29t";
         assert_eq!(output, to_base64(&from_base16(input)));
     }
 
-    #[test] // Challenge 1.2
+    #[test] // Challenge 2
     fn test_xor() {
         let one = "1c0111001f010100061a024b53535009181c";
         let two = "686974207468652062756c6c277320657965";
@@ -252,7 +374,7 @@ mod tests {
         );
     }
 
-    #[test] // Challenge 1.3
+    #[test] // Challenge 3
     fn test_find_single_char_xor_decrypt() {
         let ciphertext =
             from_base16("1b37373331363f78151b7f2b783431333d78397828372d363c78373e783a393b3736");
@@ -262,9 +384,9 @@ mod tests {
         assert_eq!("Cooking MC's like a pound of bacon", plaintext);
     }
 
-    #[test] // Challenge 1.4
+    #[test] // Challenge 4
     fn test_find_single_char_xor_decrypt_from_file() {
-        let ciphertexts: Vec<Vec<u8>> = fs::read_to_string("tst/data/01_04.txt")
+        let ciphertexts: Vec<Vec<u8>> = fs::read_to_string("tst/data/04.txt")
             .expect("Cannot read input data")
             .lines()
             .map(str::trim)
@@ -289,7 +411,7 @@ mod tests {
         assert_eq!("Now that the party is jumping\n", plaintext);
     }
 
-    #[test] // Challenge 1.5
+    #[test] // Challenge 5
     fn test_repeating_key_xor_encrypt_decrypt() {
         let expected_ciphertext = from_base16("0b3637272a2b2e63622c2e69692a23693a2a3c6324202d623d63343c2a26226324272765272a282b2f20430a652e2c652a3124333a653e2b2027630c692b20283165286326302e27282f");
         let plaintext =
@@ -303,17 +425,17 @@ mod tests {
         assert_eq!(plaintext, decrypted_plaintext);
     }
 
-    #[test] // Challenge 1.6
+    #[test] // Challenge 6
     fn test_hamming_distance() {
         let one = "this is a test".as_bytes().to_vec();
         let two = "wokka wokka!!!".as_bytes().to_vec();
         assert_eq!(37, hamming_distance(&one, &two));
     }
 
-    #[test] // Challenge 1.6
+    #[test] // Challenge 6
     fn test_find_keysize() {
         let ciphertext: Vec<u8> = from_base64(
-            fs::read_to_string("tst/data/01_06.txt")
+            fs::read_to_string("tst/data/06.txt")
                 .expect("Cannot read input data")
                 .replace('\n', "")
                 .as_str(),
@@ -327,16 +449,16 @@ mod tests {
         );
     }
 
-    #[test] // Challenge 1.7
+    #[test] // Challenge 7
     fn test_aes_128_ecb_decrypt() {
         let ciphertext: Vec<u8> = from_base64(
-            fs::read_to_string("tst/data/01_07.txt")
+            fs::read_to_string("tst/data/07.txt")
                 .expect("Cannot read input data")
                 .replace('\n', "")
                 .as_str(),
         );
         let key = "YELLOW SUBMARINE";
-        let plaintext = aes_128_ecb_decrypt(&ciphertext, &key.as_bytes().to_vec()).unwrap();
+        let plaintext = aes_128_ecb_decrypt(&ciphertext, &key.as_bytes().to_vec(), false).unwrap();
         let prelude = "I'm back and I'm ringin' the bell";
         assert_eq!(
             prelude,
@@ -344,10 +466,10 @@ mod tests {
         );
     }
 
-    #[test] // Challenge 1.8
+    #[test] // Challenge 8
     fn test_detect_ecb() {
         // basically, we just look for any entry with repeated 16-byte chunks.
-        let ciphertexts: Vec<Vec<u8>> = fs::read_to_string("tst/data/01_08.txt")
+        let ciphertexts: Vec<Vec<u8>> = fs::read_to_string("tst/data/08.txt")
             .expect("Cannot read input data")
             .lines()
             .map(from_base16)
@@ -367,6 +489,90 @@ mod tests {
         assert_eq!(
             "d880619740a8a19b7840a8a31c810a3d08649af70dc06f4fd5d2d69c744cd283e2dd052f6b641dbf9d11b0348542bb5708649af70dc06f4fd5d2d69c744cd2839475c9dfdbc1d46597949d9c7e82bf5a08649af70dc06f4fd5d2d69c744cd28397a93eab8d6aecd566489154789a6b0308649af70dc06f4fd5d2d69c744cd283d403180c98c8f6db1f2a3f9c4040deb0ab51b29933f2c123c58386b06fba186a",
             to_base16(&repeated_chunk_counts.get(0).unwrap().0)
+        );
+    }
+
+    #[test]
+    fn test_pkcs7_pad_unpad_symmetry() {
+        let max_block_size = 64;
+        let max_message_size = 1024;
+        for ii in 0..max_message_size + 1 {
+            for bs in (8..max_block_size + 1).step_by(8) {
+                let test_data = vec![0xff; ii];
+                let unpadded = test_data[0..ii].to_vec();
+                let padded = pkcs7_pad(&unpadded, bs);
+                // assert block alignment
+                assert_eq!(0, padded.len() % bs);
+                // even in block-aligned case, assert that we add a block of bytes with value of blocksize
+                assert_ne!(padded.len(), unpadded.len());
+                if padded[padded.len() - 1] as usize == bs {
+                    assert_eq!(unpadded.len() + bs, padded.len());
+                    for pad_byte in padded[unpadded.len()..].to_vec() {
+                        assert_eq!(bs as u8, pad_byte);
+                    }
+                }
+                let pad_start_idx = unpadded.len();
+                for jj in 0..pad_start_idx {
+                    assert_eq!(unpadded[jj], padded[jj]);
+                }
+                let mut pad_count = 0;
+                for _ in pad_start_idx..padded.len() {
+                    pad_count += 1;
+                }
+                if unpadded.len() != padded.len() {
+                    assert_eq!(padded[padded.len() - 1], pad_count as u8);
+                } else {
+                    assert_eq!(0, pad_count);
+                }
+                assert_eq!(unpadded, pkcs7_unpad(&padded));
+            }
+        }
+    }
+
+    #[test] // Challenge 9
+    fn test_challenge_09() {
+        assert_eq!(
+            b"YELLOW SUBMARINE\x04\x04\x04\x04".to_vec(),
+            pkcs7_pad(&"YELLOW SUBMARINE".as_bytes().to_vec(), 20)
+        );
+    }
+
+    #[test]
+    fn test_aes_128_ebc_crypt_symmetry() {
+        let plaintext = "Stop your messing around; Better think of your future, Time to straighten right out, Creating problems in town.".as_bytes().to_vec();
+        let key = "A Message 2 Rudy".as_bytes().to_vec();
+        let ciphertext = aes_128_ecb_encrypt(&plaintext, &key, true).unwrap();
+        let decrypted_plaintext = aes_128_ecb_decrypt(&ciphertext, &key, true).unwrap();
+        assert_eq!(plaintext, decrypted_plaintext);
+    }
+
+    #[test]
+    fn test_aes_128_cbc_crypt_symmetry() {
+        let plaintext = "Stop your messing around; Better think of your future, Time to straighten right out, Creating problems in town.".as_bytes().to_vec();
+        let key = "A Message 2 Rudy".as_bytes().to_vec(); // NOTE: needs to be same len as block size
+        let mut rng = rand::thread_rng();
+        let iv = (0..key.len()).map(|_| rng.gen::<u8>()).collect();
+        let ciphertext = aes_128_cbc_encrypt(&plaintext, &key, &iv, true).unwrap();
+        let decrypted_plaintext = aes_128_cbc_decrypt(&ciphertext, &key, &iv, true).unwrap();
+        assert_eq!(plaintext, decrypted_plaintext);
+    }
+
+    #[test] // Challenge 10
+    fn test_challenge_10() {
+        let ciphertext: Vec<u8> = from_base64(
+            fs::read_to_string("tst/data/10.txt")
+                .expect("Cannot read input data")
+                .replace('\n', "")
+                .as_str(),
+        );
+        let key = "YELLOW SUBMARINE";
+        let iv = vec![0u8; key.len()];
+        let plaintext =
+            aes_128_cbc_decrypt(&ciphertext, &key.as_bytes().to_vec(), &iv, true).unwrap();
+        let prelude = "I'm back and I'm ringin' the bell";
+        assert_eq!(
+            prelude,
+            String::from_utf8(plaintext[0..prelude.len()].to_vec()).unwrap()
         );
     }
 }
