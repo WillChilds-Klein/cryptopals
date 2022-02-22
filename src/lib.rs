@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::iter::FromIterator;
 
+use rand::Rng;
+
 // TODO rip out encoding dependencies, re-implement base{16,64} un/parsing
 // TODO consolidate to/from methods to take radix as parameter
 // TODO take a stab at implementing aes block cipher (ECB mode for simplicity?)
@@ -221,6 +223,58 @@ fn decrypt_xor(ciphertext: &Vec<u8>) -> Vec<u8> {
     repeating_key_xor(&ciphertext, &key)
 }
 
+// TODO fix this garbage. use actual padding attack instead of repeat.
+fn aes_128_ecb_detect(ciphertext: &Vec<u8>) -> bool {
+    // basically, we just look for any entry with repeated 16-byte chunks.
+    let mut repeated_chunk_counts = Vec::new();
+    let mut repeated_chunks = HashMap::new();
+    ciphertext
+        .chunks_exact(openssl::symm::Cipher::aes_128_ecb().block_size())
+        .for_each(|chunk| *repeated_chunks.entry(chunk.to_vec()).or_insert(0) += 1);
+    repeated_chunks.retain(|_, v| *v > 1);
+    if repeated_chunks.len() > 0 {
+        repeated_chunk_counts.push((ciphertext.clone(), repeated_chunks));
+    }
+    !repeated_chunk_counts.is_empty()
+}
+
+fn random_byte_vec(size: usize) -> Vec<u8> {
+    (0..size).map(|_| rand::thread_rng().gen::<u8>()).collect()
+}
+
+#[derive(PartialEq, Debug, Clone)]
+enum AesMode {
+    ECB,
+    CBC,
+}
+
+fn aes_mode_blackbox(input: &Vec<u8>, mode_opt: Option<AesMode>) -> Vec<u8> {
+    let key = random_byte_vec(/*AES key size in bytes*/ 16);
+    let mut rng = rand::thread_rng();
+    let mut get_filler = || vec![rng.gen::<u8>(); rng.gen::<usize>() % 6 + 5];
+    let prefix = get_filler();
+    let suffix = get_filler();
+    let mut oracle_input: Vec<u8> = Vec::new();
+    oracle_input.extend(prefix.iter());
+    oracle_input.extend(input.iter());
+    oracle_input.extend(suffix.iter());
+    let mode = match mode_opt {
+        Some(m) => m,
+        None => match rng.gen::<bool>() {
+            true => AesMode::ECB,
+            false => AesMode::CBC,
+        },
+    };
+    let ciphertext = match mode {
+        AesMode::ECB => aes_128_ecb_encrypt(&oracle_input, &key, true),
+        AesMode::CBC => {
+            let iv = (0..key.len()).map(|_| rng.gen::<u8>()).collect();
+            aes_128_cbc_encrypt(&oracle_input, &key, &iv, true)
+        }
+    };
+    ciphertext.unwrap()
+}
+
 /// @see https://datatracker.ietf.org/doc/html/rfc2315#section-10.3
 ///
 /// > For such algorithms, the method shall be to pad the input at the
@@ -267,7 +321,6 @@ fn aes_128_ecb_common(data: &Vec<u8>, key: &Vec<u8>, mode: openssl::symm::Mode) 
         let block_start = block_size * ii;
         let block_end = std::cmp::min(block_start + block_size, data.len());
         let block = data[block_start..block_end].to_vec();
-
         // NOTE: need to create new Crypter for each block due to openssl crate's limitations. they don't
         //       expose a "reset" method on the Crypter context. also, we're using lower-level Crypter instead
         //       of Cipher because the latter doesn't expose padding configuration, turns padding on by default, and
@@ -275,7 +328,6 @@ fn aes_128_ecb_common(data: &Vec<u8>, key: &Vec<u8>, mode: openssl::symm::Mode) 
         //       https://github.com/sfackler/rust-openssl/issues/1156
         let mut crypter = openssl::symm::Crypter::new(cipher, mode, key, None).unwrap();
         crypter.pad(false);
-
         let count = crypter.update(&block, block_buffer).unwrap();
         let rest = crypter.finalize(&mut block_buffer[count..]).unwrap();
         output.append(&mut block_buffer[..(count + rest)].to_vec());
@@ -283,7 +335,7 @@ fn aes_128_ecb_common(data: &Vec<u8>, key: &Vec<u8>, mode: openssl::symm::Mode) 
     Some(output)
 }
 
-// TODO clean up the Option interface -- move to Result<Vec<u8>,MyErr> where MyErr is customer error?
+// TODO clean up the Option interface -- move to Result<Vec<u8>,MyErr> where MyErr is custom error type?
 
 fn aes_128_cbc_decrypt(
     ciphertext: &Vec<u8>,
@@ -351,7 +403,6 @@ fn aes_128_cbc_encrypt(
 
 #[cfg(test)]
 mod tests {
-    use rand::Rng;
     use std::fs;
 
     use crate::*;
@@ -448,7 +499,6 @@ mod tests {
             String::from_utf8(plaintext[0..prelude.len()].to_vec()).unwrap()
         );
     }
-
     #[test] // Challenge 7
     fn test_aes_128_ecb_decrypt() {
         let ciphertext: Vec<u8> = from_base64(
@@ -468,27 +518,16 @@ mod tests {
 
     #[test] // Challenge 8
     fn test_detect_ecb() {
-        // basically, we just look for any entry with repeated 16-byte chunks.
-        let ciphertexts: Vec<Vec<u8>> = fs::read_to_string("tst/data/08.txt")
+        let ecb_encrypted: Vec<Vec<u8>> = fs::read_to_string("tst/data/08.txt")
             .expect("Cannot read input data")
             .lines()
             .map(from_base16)
+            .filter(aes_128_ecb_detect)
             .collect();
-        let mut repeated_chunk_counts = Vec::new();
-        for ciphertext in ciphertexts {
-            let mut repeated_chunks = HashMap::new();
-            ciphertext
-                .chunks_exact(16)
-                .for_each(|chunk| *repeated_chunks.entry(chunk.to_vec()).or_insert(0) += 1);
-            repeated_chunks.retain(|_, v| *v > 1);
-            if repeated_chunks.len() > 0 {
-                repeated_chunk_counts.push((ciphertext.clone(), repeated_chunks));
-            }
-        }
-        assert_eq!(1, repeated_chunk_counts.len());
+        assert_eq!(1, ecb_encrypted.len());
         assert_eq!(
             "d880619740a8a19b7840a8a31c810a3d08649af70dc06f4fd5d2d69c744cd283e2dd052f6b641dbf9d11b0348542bb5708649af70dc06f4fd5d2d69c744cd2839475c9dfdbc1d46597949d9c7e82bf5a08649af70dc06f4fd5d2d69c744cd28397a93eab8d6aecd566489154789a6b0308649af70dc06f4fd5d2d69c744cd283d403180c98c8f6db1f2a3f9c4040deb0ab51b29933f2c123c58386b06fba186a",
-            to_base16(&repeated_chunk_counts.get(0).unwrap().0)
+            to_base16(ecb_encrypted.first().unwrap())
         );
     }
 
@@ -540,7 +579,7 @@ mod tests {
     #[test]
     fn test_aes_128_ebc_crypt_symmetry() {
         let plaintext = "Stop your messing around; Better think of your future, Time to straighten right out, Creating problems in town.".as_bytes().to_vec();
-        let key = "A Message 2 Rudy".as_bytes().to_vec();
+        let key = "A Message 2uRudy".as_bytes().to_vec();
         let ciphertext = aes_128_ecb_encrypt(&plaintext, &key, true).unwrap();
         let decrypted_plaintext = aes_128_ecb_decrypt(&ciphertext, &key, true).unwrap();
         assert_eq!(plaintext, decrypted_plaintext);
@@ -549,7 +588,7 @@ mod tests {
     #[test]
     fn test_aes_128_cbc_crypt_symmetry() {
         let plaintext = "Stop your messing around; Better think of your future, Time to straighten right out, Creating problems in town.".as_bytes().to_vec();
-        let key = "A Message 2 Rudy".as_bytes().to_vec(); // NOTE: needs to be same len as block size
+        let key = "A Message 2uRudy".as_bytes().to_vec(); // NOTE: needs to be same len as block size
         let mut rng = rand::thread_rng();
         let iv = (0..key.len()).map(|_| rng.gen::<u8>()).collect();
         let ciphertext = aes_128_cbc_encrypt(&plaintext, &key, &iv, true).unwrap();
@@ -574,5 +613,27 @@ mod tests {
             prelude,
             String::from_utf8(plaintext[0..prelude.len()].to_vec()).unwrap()
         );
+    }
+
+    #[test]
+    fn test_challenge_11() {
+        fn oracle(f: fn(&Vec<u8>, Option<AesMode>) -> Vec<u8>) -> (AesMode, AesMode) {
+            // construct a pt that will have repeated blocks under ECB mode, i.e. at least a 3*16-byte of same value
+            let pt: Vec<u8> = vec![0u8; 16 * 10];
+            let mode = match rand::thread_rng().gen::<bool>() {
+                true => AesMode::CBC,
+                false => AesMode::ECB,
+            };
+            let ct = f(&pt, Some(mode.clone()));
+            let mut guess = AesMode::CBC;
+            if aes_128_ecb_detect(&ct) {
+                guess = AesMode::ECB;
+            }
+            (mode, guess)
+        }
+        for _ in 0..100 {
+            let (actual, guess) = oracle(aes_mode_blackbox);
+            assert_eq!(actual, guess);
+        }
     }
 }
